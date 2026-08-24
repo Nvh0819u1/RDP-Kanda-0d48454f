@@ -1,0 +1,247 @@
+# .github/workflows/rdp-main.yml
+# Kanda Android scrcpy — ADB TCP tunnel (no xrdp/VNC/bridge needed)
+# Vao tab Actions -> "Kanda Android scrcpy" -> Run workflow
+
+name: Kanda Android scrcpy
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "Runtime (max 360; default 355)"
+        required: false
+        default: "355"
+
+permissions:
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    env:
+      RDP_USER: kanda
+      RDP_PASS: Kandagw@12345
+      AVD_NAME: kanda_android
+      ANDROID_API: "34"
+      ANDROID_ABI: "x86_64"
+      ANDROID_TAG: "google_apis"
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_AVD_HOME: /home/runner/.android/avd
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Enable KVM permissions
+        run: |
+          echo "[+] Setting up KVM permissions..."
+          ls -la /dev/kvm 2>&1 || echo "[!] /dev/kvm not found"
+          sudo gpasswd -a $USER kvm 2>/dev/null || true
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          ls -la /dev/kvm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xvfb \
+            ffmpeg \
+            net-tools \
+            curl \
+            wget \
+            unzip \
+            adb \
+            libgl1-mesa-dri \
+            libgl1 \
+            libpulse0 \
+            scrcpy
+          echo "[+] System deps installed (incl scrcpy)"
+          scrcpy --version 2>&1 || echo "[!] scrcpy not found via apt, will use SDK scrcpy"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT=$ANDROID_HOME
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "emulator" \
+            "platforms;android-34" \
+            "system-images;android-34;google_apis;x86_64" \
+            "cmdline-tools;latest"
+          echo "PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH" >> $GITHUB_ENV
+          echo "[+] Android SDK ready"
+
+      - name: Create Android Virtual Device
+        run: |
+          export ANDROID_AVD_HOME=/home/runner/.android/avd
+          mkdir -p $ANDROID_AVD_HOME
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          echo "no" | avdmanager create avd \
+            -n kanda_android \
+            -k "system-images;android-34;google_apis;x86_64" \
+            -d pixel_6 \
+            --force
+          echo "[+] AVD created"
+
+      - name: Boot Android Emulator
+        run: |
+          set +e
+          export ANDROID_AVD_HOME=/home/runner/.android/avd
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+          Xvfb :99 -screen 0 1080x1920x24 &
+          sleep 2
+          export DISPLAY=:99
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          emulator -avd kanda_android \
+            -no-audio \
+            -no-boot-anim \
+            -no-snapshot \
+            -no-window \
+            -gpu swiftshader_indirect \
+            -accel auto \
+            -wipe-data \
+            > /tmp/emu.log 2>&1 &
+          EMU_PID=$!
+          echo "EMU_PID=$EMU_PID" >> $GITHUB_ENV
+          echo "[+] Emulator starting (PID $EMU_PID)"
+          timeout 180 adb wait-for-device
+          ADB_RESULT=$?
+          if [ $ADB_RESULT -ne 0 ]; then
+            echo "[!] adb wait-for-device failed after 180s"
+            tail -80 /tmp/emu.log
+            exit 1
+          fi
+          echo "[+] Device detected, waiting for boot..."
+          BOOT_TIMEOUT=180
+          BOOT_START=$SECONDS
+          while [ $((SECONDS - BOOT_START)) -lt $BOOT_TIMEOUT ]; do
+            BOOTED=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$BOOTED" = "1" ]; then
+              echo "[+] Emulator booted (took $((SECONDS - BOOT_START))s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "[!] Boot timed out"
+          tail -80 /tmp/emu.log
+          exit 1
+
+      - name: Enable ADB TCP and start bore tunnel
+        run: |
+          set +e
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+
+          # Enable ADB over TCP on port 5555
+          adb tcpip 5555
+          sleep 2
+          # Verify emulator is listening on 5555
+          ss -tlnp 2>/dev/null | grep 5555 && echo "[+] ADB TCP on 5555" || echo "[!] ADB TCP not listening"
+
+          # Install bore (simple TCP tunnel, free, no auth)
+          echo "[+] Installing bore..."
+          BORE_URL=$(curl -s https://api.github.com/repos/ekzhang/bore/releases/latest \
+            | grep "browser_download_url.*x86_64-unknown-linux-gnu" \
+            | cut -d '"' -f 4 | head -1)
+          if [ -z "$BORE_URL" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/0.5.1/bore-0.5.1-x86_64-unknown-linux-gnu.tar.gz"
+          fi
+          wget -q "$BORE_URL" -O /tmp/bore.tar.gz
+          tar xzf /tmp/bore.tar.gz -C /tmp
+          chmod +x /tmp/bore
+          echo "[+] bore installed: $(/tmp/bore --version 2>&1 || echo 'ok')"
+
+          # Start bore tunnel: expose local 5555 via bore.pub
+          echo "[+] Starting bore tunnel..."
+          /tmp/bore local 5555 --to bore.pub > /tmp/bore.log 2>&1 &
+          BORE_PID=$!
+          echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
+          sleep 5
+
+          # Extract the public port from bore output
+          BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' /tmp/bore.log || \
+                      grep -oP 'bore.pub:\K\d+' /tmp/bore.log || \
+                      grep -oP ':\K\d+' /tmp/bore.log | head -1)
+
+          if [ -z "$BORE_PORT" ]; then
+            echo "[!] Could not parse bore port, raw log:"
+            cat /tmp/bore.log
+            # Fallback: try serveo.net SSH tunnel
+            echo "[+] Trying serveo.net fallback..."
+            ssh -o StrictHostKeyChecking=no -R 5555:localhost:5555 serveo.net &
+            sleep 5
+            BORE_PORT="see serveo.net output"
+          fi
+
+          echo "BORE_PORT=$BORE_PORT" >> $GITHUB_ENV
+
+          echo ""
+          echo "========================================"
+          echo "  KANDA ANDROID SCRCPY READY"
+          echo "========================================"
+          echo ""
+          echo "  ADB TCP: localhost:5555 (tunneled)"
+          echo "  Tunnel:  bore.pub:$BORE_PORT"
+          echo ""
+          echo "  CONNECT FROM YOUR PC:"
+          echo "  1. Install scrcpy:  https://github.com/Genymobile/scrcpy/releases"
+          echo "  2. adb connect bore.pub:$BORE_PORT"
+          echo "  3. scrcpy"
+          echo "  4. (optional) scrcpy --turn-screen-off --stay-awake"
+          echo ""
+          echo "  Or one-liner:"
+          echo "  adb connect bore.pub:$BORE_PORT && scrcpy"
+          echo "========================================"
+          echo ""
+
+      - name: Keep alive
+        run: |
+          if [ "${{ inputs.runtime_minutes }}" = "355" ]; then
+            RUNTIME=21300
+          else
+            RUNTIME=$(( $(echo "${{ inputs.runtime_minutes }}" | head -c3) * 60 ))
+            if [ "$RUNTIME" -gt 36000 ]; then RUNTIME=36000; fi
+          fi
+          echo "[keepalive] Runtime: $RUNTIME seconds"
+          END=$((SECONDS + RUNTIME))
+          i=0
+          while [ $SECONDS -lt $END ]; do
+            i=$((i + 1))
+            echo "[scrcpy] Heartbeat #$i $(date '+%H:%M:%S')"
+            if ! adb shell echo ok >/dev/null 2>&1; then
+              echo "[!] Emulator down, restarting..."
+              adb emu kill 2>/dev/null || true
+              sleep 3
+              export ANDROID_AVD_HOME=/home/runner/.android/avd
+              emulator -avd kanda_android -no-audio -no-boot-anim -no-snapshot -no-window -gpu swiftshader_indirect -accel auto -wipe-data > /tmp/emu-restart.log 2>&1 &
+              sleep 15
+              timeout 60 adb wait-for-device || echo "[!] restart failed"
+              adb tcpip 5555 2>/dev/null || true
+            fi
+            # Check bore tunnel
+            if ! kill -0 $BORE_PID 2>/dev/null; then
+              echo "[!] bore tunnel down, restarting..."
+              /tmp/bore local 5555 --to bore.pub > /tmp/bore.log 2>&1 &
+              BORE_PID=$!
+              sleep 5
+              BORE_PORT=$(grep -oP 'listening at bore.pub:\K\d+' /tmp/bore.log || echo "unknown")
+              echo "[+] bore restarted: bore.pub:$BORE_PORT"
+            fi
+            sleep 60
+          done
+          echo "[scrcpy] Time's up, shutting down"
